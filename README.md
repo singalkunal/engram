@@ -1,6 +1,6 @@
 # engram
 
-Your coding agent forgets everything between sessions. This script remembers.
+  Your coding agent forgets everything between sessions. This script helps agent remember them by mutating its skills and memories.
 
 Mines session traces, detects personal patterns via LLM analysis, writes results back as Claude Code skills and memory entries.
 
