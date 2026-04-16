@@ -92,7 +92,7 @@ LLM_MODEL_CROSS_SESSION=google/gemini-2.5-flash      # stronger pattern detectio
 | `deepseek/deepseek-r1-0528` | $0.50/M | Deep pattern detection |
 | `anthropic/claude-sonnet-4` | $3/M | Highest quality |
 
-Full 7-day analysis (19 sessions) costs ~$0.10 with DeepSeek. Set `LLM_PROVIDER=claude-code` to use your existing subscription instead.
+No API key? Set `LLM_PROVIDER=claude-code` to use your local Claude Code CLI instead (uses your existing subscription, no extra cost).
 
 ## What it finds
 
@@ -110,6 +110,12 @@ The bar: would a fresh AI session get this wrong without this info? If yes, it's
 ## Trace providers
 
 Currently uses [Staso](https://staso.ai). Swap `staso.py` for other providers.
+
+## Inspiration
+
+- [Hermes Agent](https://hermes-agent.nousresearch.com) -- in-session self-learning with skills, memory, and cross-session recall via SQLite FTS5
+- [OpenClaw](https://github.com/openclaw/openclaw) -- personal AI assistant with persistent memory and skill acquisition
+- Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) -- modify, test, keep/discard loop with git as memory
 
 ## License
 

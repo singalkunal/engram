@@ -31,6 +31,16 @@ load_dotenv(pathlib.Path(__file__).parent.parent / ".env", override=True)
 from engram import staso, compress, llm
 from engram.prompts import PER_SESSION, CROSS_SESSION, COMMON_INSTRUCTIONS
 
+
+def _progress(label: str, done: int, total: int, suffix: str = ""):
+    """Print an inline progress bar that overwrites itself."""
+    w = 20
+    filled = int(w * done / total) if total else w
+    bar = "=" * filled + "-" * (w - filled)
+    end = "\n" if done >= total else "\r"
+    extra = f" {suffix}" if suffix else ""
+    print(f"  [{bar}] {done}/{total} {label}{extra}", end=end, flush=True)
+
 # ---------------------------------------------------------------------------
 # Paths — auto-detect or override via env
 # ---------------------------------------------------------------------------
@@ -183,7 +193,8 @@ def log_evolution(entries: list[dict], dry_run: bool):
 # Review file
 # ---------------------------------------------------------------------------
 
-def _write_review_md(path: pathlib.Path, skills: list, memories: list, insights: list):
+def _write_review_md(path: pathlib.Path, skills: list, memories: list, insights: list,
+                     session_summaries: list[tuple[int, dict]] | None = None):
     """Generate a human-readable markdown review of candidates."""
     lines = [f"# engram review -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
     lines.append(f"Delete unwanted entries from the companion `.json` file, then run `--apply-from`.\n")
@@ -216,6 +227,22 @@ def _write_review_md(path: pathlib.Path, skills: list, memories: list, insights:
             lines.append(f"- **[{ins.get('type','?')}]** ({ins.get('confidence',0):.2f}, {ins.get('session_count','?')} sessions): {ins.get('description','')}")
             if ins.get("suggestion"):
                 lines.append(f"  - Suggestion: {ins['suggestion']}")
+            lines.append("")
+
+    # Append per-session summaries for reference
+    if session_summaries:
+        lines.append(f"\n---\n\n## Per-Session Summaries (reference)\n")
+        for idx, summary in session_summaries:
+            goal = summary.get('goal', '?')
+            lines.append(f"### Session {idx+1}: {goal} [{summary.get('domain', '?')}]\n")
+            for c in summary.get("corrections", []):
+                lines.append(f"- **correction**: {c.get('rejected', '')} -> {c.get('accepted', '')}")
+                if c.get("quote"):
+                    lines.append(f"  > \"{c['quote']}\"")
+            for e in summary.get("errors", []):
+                lines.append(f"- **error**: {e.get('error', '')} -> {e.get('resolution', '')}")
+            if summary.get("notable"):
+                lines.append(f"- **notable**: {summary['notable']}")
             lines.append("")
 
     path.write_text("\n".join(lines))
@@ -320,28 +347,30 @@ def main():
         interesting.sort(key=lambda c: c.get("total_spans", 0), reverse=True)
         if args.limit:
             interesting = interesting[:args.limit]
-        print(f"[learn] {len(interesting)} interesting (filtered from {len(conversations)})")
-        for conv in interesting:
+        print(f"[learn] fetching {len(interesting)} sessions (from {len(conversations)} total)")
+        for ci, conv in enumerate(interesting):
             sid = conv["session_id"]
-            print(f"[learn] fetching {sid[:8]}... ({conv.get('trace_count', 0)} traces, {conv.get('total_spans', 0)} spans)")
+            _progress("fetched", ci, len(interesting))
             traces = staso.fetch_traces_for_session(sid, start, end)
             all_spans = []
             for t in traces:
                 all_spans.extend(staso.fetch_trace_detail(t["trace_id"]).get("spans", []))
             session_data.append((conv, traces, all_spans))
+        _progress("fetched", len(interesting), len(interesting))
 
     if not session_data:
         print("[learn] no sessions to analyze")
         return
 
     # Phase 2: Compress
-    print(f"\n[learn] compressing {len(session_data)} session(s)...")
     summaries = []
+    total_spans = 0
     for i, (session, traces, spans) in enumerate(session_data):
         summary = compress.compress_session(session, traces, spans)
         summaries.append(f"=== Session {i+1} ===\n{summary}")
-        print(f"  session {i+1}: {len(spans)} spans -> {len(summary)} chars")
+        total_spans += len(spans)
     combined = "\n\n".join(summaries)
+    print(f"[learn] compressed {len(session_data)} sessions ({total_spans} spans)")
 
     # Phase 3: Analyze (per-session + cross-session)
     skills_index = load_skills_index()
@@ -375,27 +404,26 @@ def main():
             print(f"[learn] LLM error (per-session): {e}")
             return None
 
-    print(f"[learn] per-session summarization using {per_session_str}")
+    print(f"[learn] per-session pass ({per_session_str})")
     session_llm_summaries = []
-    immediate_candidates = []  # behavioral candidates from single sessions
+    immediate_candidates = []
+    completed = 0
     with ThreadPoolExecutor(max_workers=min(len(summaries), 6)) as pool:
         futures = {pool.submit(_summarize_session, s): i for i, s in enumerate(summaries)}
         for f in as_completed(futures):
+            completed += 1
+            _progress("sessions", completed, len(summaries))
             idx = futures[f]
             result = f.result()
             if result:
                 summary = result.get("session_summary", result)
                 session_llm_summaries.append((idx, summary))
-                corr_count = len(summary.get("corrections", []))
-                err_count = len(summary.get("errors", []))
-                # Collect immediate behavioral candidates
                 imm = result.get("immediate_candidates", [])
                 for c in imm:
                     c["session_count"] = 1
                     c["action"] = c.get("action", "create")
                     c.setdefault("confidence", 0.65)
                     c["confidence"] = min(c["confidence"], IMMEDIATE_CONFIDENCE_CAP)
-                    # Ensure skill candidates have a path, memory candidates have a filename
                     if c.get("kind") == "skill" and not c.get("path"):
                         c["path"] = "common/" + c.get("name", "unknown").lower().replace(" ", "-")
                     if c.get("kind") != "skill" and not c.get("filename"):
@@ -403,18 +431,13 @@ def main():
                     if not c.get("type") and c.get("kind") != "skill":
                         c["type"] = "feedback"
                 immediate_candidates.extend(imm)
-                imm_str = f", {len(imm)} immediate" if imm else ""
-                print(f"  session {idx+1}: {corr_count} corrections, {err_count} errors{imm_str}")
 
     session_llm_summaries.sort(key=lambda x: x[0])
     if not session_llm_summaries:
         print("[learn] no sessions summarized successfully")
         return
 
-    if immediate_candidates:
-        print(f"[learn] {len(immediate_candidates)} behavioral candidate(s) from per-session pass")
-
-    # Drop trivial sessions (no corrections, no content, no notable signal)
+    # Drop trivial sessions
     def _is_trivial(summary: dict) -> bool:
         return (
             not summary.get("corrections")
@@ -426,31 +449,14 @@ def main():
     before = len(session_llm_summaries)
     session_llm_summaries = [(idx, s) for idx, s in session_llm_summaries if not _is_trivial(s)]
     dropped = before - len(session_llm_summaries)
-    if dropped:
-        print(f"[learn] dropped {dropped} trivial session(s)")
+    total_corrections = sum(len(s.get("corrections", [])) for _, s in session_llm_summaries)
+    print(f"[learn] per-session: {len(session_llm_summaries)} sessions ({dropped} trivial dropped), {total_corrections} corrections, {len(immediate_candidates)} immediate candidates")
 
     # Build structured input for cross-session pass
     structured_summaries = []
     for idx, summary in session_llm_summaries:
         structured_summaries.append(f"=== Session {idx+1} ===\n{json.dumps(summary, indent=2)}")
     cross_session_input = "\n\n".join(structured_summaries)
-
-    # Show per-session summaries if requested
-    if args.show_candidates:
-        sep = "-" * 60
-        print(f"\n{sep}\nPER-SESSION SUMMARIES\n{sep}")
-        for idx, summary in session_llm_summaries:
-            goal = (summary.get('goal', '?'))[:80]
-            print(f"\n  Session {idx+1}: {goal} [{summary.get('domain', '?')}]")
-            for c in summary.get("corrections", []):
-                print(f"    correction: {c.get('rejected', '')[:60]} -> {c.get('accepted', '')[:60]}")
-            for e in summary.get("errors", []):
-                print(f"    error: {e.get('error', '')[:80]}")
-        if immediate_candidates:
-            print(f"\n  Immediate behavioral: {len(immediate_candidates)}")
-            for i, c in enumerate(immediate_candidates, 1):
-                print(f"    [{i}] {c.get('name', '?')} -- {c.get('evidence', '')[:80]}")
-        print(f"{sep}\n")
 
     # Pass 2: Cross-session — find patterns, generate candidates
     if len(session_llm_summaries) < 2:
@@ -471,7 +477,7 @@ def main():
     else:
         imm_context = "  (none)"
 
-    print(f"\n[learn] cross-session analysis using {cross_session_str}")
+    print(f"[learn] cross-session pass ({cross_session_str})")
     cross_prompt = (
         CROSS_SESSION
         .replace("{n_days}", str(n_days))
@@ -482,12 +488,13 @@ def main():
         .replace("{immediate_candidates}", imm_context)
         .replace("{session_summaries}", cross_session_input)
     )
-    print(f"[learn] cross-session -- prompt: {len(cross_prompt)} chars")
 
+    print(f"  [analyzing {len(session_llm_summaries)} sessions...]", end="", flush=True)
     try:
         result = call_llm(cross_prompt, model_override=cross_session_model)
+        print(" done")
     except Exception as e:
-        print(f"[learn] LLM error (cross-session): {e}")
+        print(f" error: {e}")
         return
 
     candidate_skills = result.get("candidate_skills", [])
@@ -536,7 +543,7 @@ def main():
         save_path.write_text(json.dumps(save_data, indent=2))
         # Generate companion review file
         review_path = save_path.with_suffix(".md")
-        _write_review_md(review_path, candidate_skills, candidate_memories, insights)
+        _write_review_md(review_path, candidate_skills, candidate_memories, insights, session_llm_summaries)
         print(f"[learn] saved to {save_path}")
         print(f"[learn] review: {review_path}")
         print(f"[learn] edit {save_path.name} to remove unwanted candidates, then:")
@@ -566,15 +573,19 @@ def main():
                 print(f"      {ins.get('description','')[:120]}")
         print(f"\n{sep}")
 
-    _apply_and_log(candidate_skills, candidate_memories, insights, args, force_apply=False)
+    _apply_and_log(candidate_skills, candidate_memories, insights, args,
+                    force_apply=False, quiet=args.show_candidates)
 
 
-def _apply_and_log(candidate_skills, candidate_memories, insights, args, force_apply=False):
+def _apply_and_log(candidate_skills, candidate_memories, insights, args,
+                    force_apply=False, quiet=False):
     """Apply candidates and log evolution. Used by both normal flow and --apply-from.
-    When force_apply=True (from --apply-from), all candidates are applied regardless of confidence."""
+    When force_apply=True (from --apply-from), all candidates are applied regardless of confidence.
+    When quiet=True, only print auto-applied entries (skip flag/log lines already shown by --show-candidates)."""
     log_entries = []
 
-    print("\n[learn] skills:")
+    if not quiet:
+        print("\n[learn] skills:")
     for s in candidate_skills:
         conf = s.get("confidence", 0)
         path = s.get("path", "?")
@@ -588,14 +599,17 @@ def _apply_and_log(candidate_skills, candidate_memories, insights, args, force_a
             status = "auto-applied" if not args.dry_run else "dry-run"
             print(f"  apply ({conf:.2f}) [{action}] {path} -- {msg}")
         elif conf >= FLAG_REVIEW:
-            print(f"  flag  ({conf:.2f}) [{action}] {path} -- {evidence}")
+            if not quiet:
+                print(f"  flag  ({conf:.2f}) [{action}] {path} -- {evidence}")
             status = "flagged"
         else:
-            print(f"  log   ({conf:.2f}) [{action}] {path}")
+            if not quiet:
+                print(f"  log   ({conf:.2f}) [{action}] {path}")
         log_entries.append({"action": action, "type": "skill", "path": path,
                             "confidence": conf, "applied": status, "evidence": evidence})
 
-    print("\n[learn] memories:")
+    if not quiet:
+        print("\n[learn] memories:")
     for m in candidate_memories:
         conf = m.get("confidence", 0)
         filename = m.get("filename", "?")
@@ -609,30 +623,33 @@ def _apply_and_log(candidate_skills, candidate_memories, insights, args, force_a
             status = "auto-applied" if not args.dry_run else "dry-run"
             print(f"  apply ({conf:.2f}) [{action}] {filename} -- {msg}")
         elif conf >= FLAG_REVIEW:
-            print(f"  flag  ({conf:.2f}) [{action}] {filename} -- {evidence}")
+            if not quiet:
+                print(f"  flag  ({conf:.2f}) [{action}] {filename} -- {evidence}")
             status = "flagged"
         else:
-            print(f"  log   ({conf:.2f}) [{action}] {filename}")
+            if not quiet:
+                print(f"  log   ({conf:.2f}) [{action}] {filename}")
         log_entries.append({"action": action, "type": "memory", "path": filename,
                             "confidence": conf, "applied": status, "evidence": evidence})
 
-    print("\n[learn] insights:")
+    if not quiet:
+        print("\n[learn] insights:")
     for ins in insights:
         conf = ins.get("confidence", 0)
         if conf >= args.min_confidence:
-            print(f"  ({conf:.2f}) [{ins.get('type','?')}] {ins.get('description','')}")
-            if ins.get("suggestion"):
-                print(f"          -> {ins.get('suggestion','')}")
+            if not quiet:
+                print(f"  ({conf:.2f}) [{ins.get('type','?')}] {ins.get('description','')}")
+                if ins.get("suggestion"):
+                    print(f"          -> {ins.get('suggestion','')}")
             log_entries.append({"action": "insight", "type": ins.get("type", "?"), "path": "-",
                                 "confidence": conf, "applied": "logged", "evidence": ins.get("description", "")[:100]})
 
     if log_entries:
         log_evolution(log_entries, dry_run=args.dry_run)
-        print(f"\n[learn] logged {len(log_entries)} entries to {EVOLUTION_LOG}")
 
     applied = sum(1 for e in log_entries if e["applied"] == "auto-applied")
     flagged = sum(1 for e in log_entries if e["applied"] == "flagged")
-    print(f"[learn] done -- applied: {applied}, flagged: {flagged}")
+    print(f"\n[learn] done -- {len(log_entries)} logged, {applied} applied, {flagged} flagged")
 
 
 if __name__ == "__main__":
