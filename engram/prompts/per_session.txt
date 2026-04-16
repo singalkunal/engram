@@ -61,6 +61,16 @@ FEATURE-SPECIFIC — the user is directing the current task:
 THE TEST: Would this correction apply if the user started a completely different project
 tomorrow? YES → behavioral. NO → feature-specific.
 
+Common mistakes — these are NEVER behavioral:
+- Feedback about the tool/script being built in this session ("too much output", "add a flag")
+  → that's a feature request, not a behavioral preference
+- Removing or changing an auth method, config format, or API path in a specific codebase
+  → that's an implementation decision about this project
+- Telling the agent to use a specific library, endpoint, or file structure for the current task
+  → that's directing the work, not correcting agent behavior
+- Asking for changes to documentation, README, or config files in the current repo
+  → that's task execution, even if the user sounds frustrated
+
 ## When to use memory vs skill for immediate_candidates
 
 MEMORY (kind: "memory"): simple one-liner preference or fact.

@@ -65,8 +65,10 @@ The actual preference or fact. Include why when known.
 - Confidence caps: 2 sessions = 0.70 max, 3 sessions = 0.85 max, 4+ sessions = 0.95 max.
 - session_count must reflect actual sessions where the pattern appeared.
 - Prefer updating existing skills/memories over creating new ones.
-- Check existing skills and memories — don't propose what's already there.
+- Check existing skills and memories — if an existing skill already covers the topic, propose an UPDATE to that skill instead of creating a new one that overlaps.
+- If a candidate would be a subset of an existing skill, don't propose it at all.
 - If 2+ corrections are about the same theme, consolidate into ONE candidate (usually a skill).
+- Don't create both a memory AND a skill for the same pattern — pick the better fit.
 - Fewer, sharper candidates > many generic ones.
 - Quote the user's actual words in evidence fields.
 - Insights must be about USER behavior, NOT agent/platform limitations.
