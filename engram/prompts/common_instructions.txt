@@ -1,0 +1,84 @@
+## Output Format (strict JSON, no markdown)
+{
+  "candidate_skills": [
+    {
+      "action": "create|update",
+      "path": "path relative to .claude/skills/ e.g. common/my-skill",
+      "name": "skill name",
+      "description": "one-line description",
+      "content": "full SKILL.md content (YAML frontmatter + instructions)",
+      "confidence": 0.0,
+      "evidence": "corrections or behaviors from 2+ sessions that prove this — quote user words",
+      "session_count": 0
+    }
+  ],
+  "candidate_memories": [
+    {
+      "action": "create|update",
+      "type": "user|feedback|project|reference",
+      "filename": "memory_slug.md",
+      "name": "memory name",
+      "description": "one-line for MEMORY.md index",
+      "content": "full memory file content including YAML frontmatter",
+      "confidence": 0.0,
+      "evidence": "corrections or behaviors from 2+ sessions that prove this — quote user words",
+      "session_count": 0
+    }
+  ],
+  "insights": [
+    {
+      "type": "workflow_pattern|correction_pattern|cost_inefficiency|communication_pattern",
+      "description": "pattern observed across sessions",
+      "confidence": 0.0,
+      "session_count": 0,
+      "suggestion": "how future sessions should adapt"
+    }
+  ]
+}
+
+## Content format
+
+Skill content must be a valid SKILL.md:
+```
+---
+name: skill-name
+description: one-line description
+---
+# Skill Name
+
+Clear instructions the agent should follow when doing this type of work.
+Include specific do's and don'ts with examples.
+```
+
+Memory content must include YAML frontmatter:
+```
+---
+name: Memory Name
+description: one-line description
+type: feedback
+---
+The actual preference or fact. Include why when known.
+```
+
+## Rules
+- ONLY propose candidates backed by evidence from 2+ sessions.
+- Confidence caps: 2 sessions = 0.70 max, 3 sessions = 0.85 max, 4+ sessions = 0.95 max.
+- session_count must reflect actual sessions where the pattern appeared.
+- Prefer updating existing skills/memories over creating new ones.
+- Check existing skills and memories — don't propose what's already there.
+- If 2+ corrections are about the same theme, consolidate into ONE candidate (usually a skill).
+- Fewer, sharper candidates > many generic ones.
+- Quote the user's actual words in evidence fields.
+- Insights must be about USER behavior, NOT agent/platform limitations.
+- Output ONLY valid JSON, nothing else.
+
+## Skill vs Memory
+
+SKILL = instructions for a type of work. Loaded on demand. Multi-step or multi-rule.
+Examples: "how to write external copy", "coding conventions for tests", "changelog procedure"
+
+MEMORY = one-liner fact or preference about the user. Always in context.
+Examples: "no emojis", "use uv not pip", "lowercase commits"
+
+If related corrections consolidate into a coherent guideline → skill.
+If it's a standalone preference → memory.

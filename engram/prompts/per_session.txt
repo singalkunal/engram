@@ -1,0 +1,107 @@
+You are summarizing a SINGLE Claude Code session. Extract structured signal.
+
+Your output has two parts:
+1. A factual session summary (feeds a cross-session pattern analyzer)
+2. Immediate candidates for BEHAVIORAL corrections only (explicit user directives about
+   how the agent should work, not about the current task)
+
+## Session Data
+{session_summaries}
+
+## Output Format (strict JSON, no markdown)
+{
+  "session_summary": {
+    "goal": "what the user was trying to accomplish",
+    "domain": "area of codebase or product (e.g. frontend/auth, backend/billing, infra/ci)",
+    "corrections": [
+      {
+        "rejected": "what the agent did or proposed",
+        "accepted": "what the user wanted instead",
+        "quote": "user's actual words if available"
+      }
+    ],
+    "errors": [
+      {
+        "error": "what went wrong",
+        "resolution": "how it was fixed or worked around"
+      }
+    ],
+    "content_produced": ["brief descriptions of artifacts created or modified"],
+    "tools_used": ["tool names and rough usage pattern"],
+    "notable": "anything surprising or non-obvious about this session (empty string if nothing)"
+  },
+  "immediate_candidates": [
+    {
+      "kind": "memory or skill",
+      "name": "short name",
+      "description": "one-line description",
+      "content": "full file content (YAML frontmatter + body for memories, SKILL.md format for skills)",
+      "evidence": "exact user quote proving this is a standing directive",
+      "confidence": 0.65
+    }
+  ]
+}
+
+## Behavioral vs Feature-Specific (STRICT)
+
+Only BEHAVIORAL corrections become immediate_candidates.
+
+BEHAVIORAL — the user is telling the agent how to behave in general:
+- Standing orders: "don't ever X", "always Y", "stop doing Z"
+- Tone/style corrections: "be more concise", "no emojis", "don't summarize"
+- Cross-project preferences: "use uv not pip", "lowercase commits"
+- Agent defaults the user rejects: "don't mock databases in tests"
+
+FEATURE-SPECIFIC — the user is directing the current task:
+- "use this function not that one" in a specific file
+- "the endpoint should return X"
+- "use a queue here not polling"
+- "the error is in line 42"
+
+THE TEST: Would this correction apply if the user started a completely different project
+tomorrow? YES → behavioral. NO → feature-specific.
+
+## When to use memory vs skill for immediate_candidates
+
+MEMORY (kind: "memory"): simple one-liner preference or fact.
+  Example: "no emojis" → memory
+
+SKILL (kind: "skill"): multi-rule guideline or procedure for a type of work.
+  Example: user corrects external messaging across multiple points in one session
+  (no overselling, outcome-focused, honest about limitations) → skill about
+  "how to communicate product capabilities"
+
+Most behavioral corrections from a single session will be memories. Only propose a skill
+when the correction contains MULTIPLE related rules about how to do a type of task.
+
+## Content format
+
+For memories, content must include YAML frontmatter:
+```
+---
+name: ...
+description: ...
+type: feedback|user|reference
+---
+Body text here.
+```
+
+For skills, content must be a SKILL.md:
+```
+---
+name: ...
+description: ...
+---
+# Skill Name
+
+Instructions the agent should follow when doing this type of work.
+```
+
+## Rules
+- Be factual in the summary. Don't interpret patterns — that's the cross-session analyzer's job.
+- Quote the user's actual words in correction and evidence fields.
+- immediate_candidates must be EMPTY unless there is a clear behavioral correction with a direct user quote.
+- If multiple corrections in the session are about the same theme, consolidate into ONE candidate.
+- Maximum 3 immediate_candidates per session. Keep only the strongest.
+- Confidence is always 0.65. Never higher.
+- Output ONLY valid JSON, nothing else.

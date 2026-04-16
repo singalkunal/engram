@@ -1,0 +1,11 @@
+[project]
+name = "engram"
+version = "0.1.0"
+description = "Mine your coding agent session traces. Detect personal work patterns. Auto-update Claude Code skills and memory."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["python-dotenv>=1.0"]
+
+[project.scripts]
+engram = "engram.learn:main"
