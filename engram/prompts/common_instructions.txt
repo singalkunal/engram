@@ -3,12 +3,12 @@
   "candidate_skills": [
     {
       "action": "create|update",
-      "path": "path relative to .claude/skills/ e.g. common/my-skill",
+      "path": "path relative to skills dir (e.g. common/my-skill)",
       "name": "skill name",
       "description": "one-line description",
-      "content": "full SKILL.md content (YAML frontmatter + instructions)",
+      "content": "full SKILL.md content with YAML frontmatter",
+      "evidence": "user quotes from 2+ sessions proving this pattern",
       "confidence": 0.0,
-      "evidence": "corrections or behaviors from 2+ sessions that prove this — quote user words",
       "session_count": 0
     }
   ],
@@ -19,68 +19,36 @@
       "filename": "memory_slug.md",
       "name": "memory name",
       "description": "one-line for MEMORY.md index",
-      "content": "full memory file content including YAML frontmatter",
+      "content": "full memory file content with YAML frontmatter",
+      "evidence": "user quotes from 2+ sessions proving this pattern",
       "confidence": 0.0,
-      "evidence": "corrections or behaviors from 2+ sessions that prove this — quote user words",
       "session_count": 0
     }
   ],
   "insights": [
     {
-      "type": "workflow_pattern|correction_pattern|cost_inefficiency|communication_pattern",
+      "type": "workflow_pattern|correction_pattern|consolidation_opportunity",
       "description": "pattern observed across sessions",
       "confidence": 0.0,
-      "session_count": 0,
-      "suggestion": "how future sessions should adapt"
+      "session_count": 0
     }
   ]
 }
 
-## Content format
-
-Skill content must be a valid SKILL.md:
-```
----
-name: skill-name
-description: one-line description
----
-# Skill Name
-
-Clear instructions the agent should follow when doing this type of work.
-Include specific do's and don'ts with examples.
-```
-
-Memory content must include YAML frontmatter:
-```
----
-name: Memory Name
-description: one-line description
-type: feedback
----
-The actual preference or fact. Include why when known.
-```
-
-## Rules
-- ONLY propose candidates backed by evidence from 2+ sessions.
-- Confidence caps: 2 sessions = 0.70 max, 3 sessions = 0.85 max, 4+ sessions = 0.95 max.
-- session_count must reflect actual sessions where the pattern appeared.
-- Prefer updating existing skills/memories over creating new ones.
-- Check existing skills and memories — if an existing skill already covers the topic, propose an UPDATE to that skill instead of creating a new one that overlaps.
-- If a candidate would be a subset of an existing skill, don't propose it at all.
-- If 2+ corrections are about the same theme, consolidate into ONE candidate (usually a skill).
-- Don't create both a memory AND a skill for the same pattern — pick the better fit.
-- Fewer, sharper candidates > many generic ones.
-- Quote the user's actual words in evidence fields.
-- Insights must be about USER behavior, NOT agent/platform limitations.
-- Output ONLY valid JSON, nothing else.
-
 ## Skill vs Memory
 
-SKILL = instructions for a type of work. Loaded on demand. Multi-step or multi-rule.
-Examples: "how to write external copy", "coding conventions for tests", "changelog procedure"
+SKILL: multi-rule guideline for a type of work. Loaded on demand. Body usually 100+ words.
+MEMORY: single fact, preference, or correction. Always in context. Body usually under 100 words.
 
-MEMORY = one-liner fact or preference about the user. Always in context.
-Examples: "no emojis", "use uv not pip", "lowercase commits"
+If a skill body would be under ~100 words → it's a memory.
 
-If related corrections consolidate into a coherent guideline → skill.
-If it's a standalone preference → memory.
+## Rules
+
+- ONLY propose candidates backed by evidence from 2+ sessions.
+- Confidence caps: 2 sessions = 0.70, 3 sessions = 0.85, 4+ sessions = 0.95.
+- session_count must match actual sessions where the pattern appeared.
+- Don't create both a memory AND a skill for the same pattern — pick one.
+- Quote the user's actual words in evidence fields.
+- Insights must be about USER behavior. Platform/tool issues are never insights.
+- Content must include valid YAML frontmatter (`---` on its own line, fields on their own lines, `---` on its own line).
+- Output ONLY valid JSON, nothing else.

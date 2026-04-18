@@ -8,16 +8,16 @@ engram — self-learning loop for coding agents.
 Mines session traces, detects personal patterns, auto-updates skills + memory.
 
 Usage:
-  uv run python -m engram.learn --hours 168 --dry-run --show-candidates
-  uv run python -m engram.learn --hours 24
-  uv run python -m engram.learn --hours 168 --save candidates.json
-  uv run python -m engram.learn --apply-from candidates.json
+  uv run python -m engram.learn --hours 168 --save        # auto-saves to runs/<timestamp>_<h>h/
+  uv run python -m engram.learn --hours 168 --show-candidates
+Then in Claude Code: /engram-apply runs/latest/candidates.md
 """
 
 import argparse
 import json
 import os
 import pathlib
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -28,18 +28,89 @@ from dotenv import load_dotenv
 load_dotenv(pathlib.Path.cwd() / ".env")
 load_dotenv(pathlib.Path(__file__).parent.parent / ".env", override=True)
 
+import sys
+import time
+
 from engram import staso, compress, llm
 from engram.prompts import PER_SESSION, CROSS_SESSION, COMMON_INSTRUCTIONS
 
 
+_progress_starts: dict[str, float] = {}
+_IS_TTY = sys.stdout.isatty()
+
+
+_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_filename(raw: str) -> str:
+    """Collapse unsafe chars (/, spaces, etc.) into underscores. Returns a single segment.
+
+    Preserves meaningful tokens — slashes are flattened, not stripped.
+    Blocks `..` traversal patterns.
+    """
+    if not raw:
+        return "unknown.md"
+    # Block directory traversal
+    raw = raw.replace("..", "")
+    # Flatten path separators into underscores (preserves info from "foo/bar" -> "foo_bar")
+    raw = raw.replace("\\", "_").replace("/", "_")
+    raw = _FILENAME_SAFE_RE.sub("_", raw.lower())
+    # Collapse runs of underscores
+    while "__" in raw:
+        raw = raw.replace("__", "_")
+    raw = raw.strip("._")
+    if not raw:
+        return "unknown.md"
+    if not raw.endswith(".md"):
+        raw += ".md"
+    return raw
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s"
+
+
 def _progress(label: str, done: int, total: int, suffix: str = ""):
-    """Print an inline progress bar that overwrites itself."""
-    w = 20
-    filled = int(w * done / total) if total else w
-    bar = "=" * filled + "-" * (w - filled)
-    end = "\n" if done >= total else "\r"
-    extra = f" {suffix}" if suffix else ""
-    print(f"  [{bar}] {done}/{total} {label}{extra}", end=end, flush=True)
+    """Inline progress bar (TTY only). Non-TTY prints a single line on completion.
+
+    TTY format: ████████░░░░░░░░  42%  5/12  label  3s
+    Non-TTY:    done: 12/12 label in 3s
+    """
+    if label not in _progress_starts:
+        _progress_starts[label] = time.time()
+    elapsed = time.time() - _progress_starts[label]
+
+    if not _IS_TTY:
+        # Pipe/log/cron: print only the completion line, once
+        if done >= total:
+            _progress_starts.pop(label, None)
+            extra = f"  {suffix}" if suffix else ""
+            print(f"  done: {done}/{total} {label} in {_fmt_elapsed(elapsed)}{extra}", flush=True)
+        return
+
+    w = 24
+    pct = (done / total) if total else 1.0
+    filled = int(round(w * pct))
+    bar = "█" * filled + "░" * (w - filled)
+    pct_int = int(round(pct * 100))
+    time_str = _fmt_elapsed(elapsed)
+    extra = f"  {suffix}" if suffix else ""
+
+    count_width = len(str(total))
+    counter = f"{done:>{count_width}}/{total}"
+
+    line = f"  {bar}  {pct_int:>3d}%  {counter}  {label}  {time_str}{extra}"
+
+    # \r + ANSI clear-to-end-of-line so the final frame cleanly overwrites prior renders
+    clear = "\r\033[K"
+    if done >= total:
+        _progress_starts.pop(label, None)
+        print(f"{clear}{line}", flush=True)
+    else:
+        print(f"{clear}{line}", end="", flush=True)
 
 # ---------------------------------------------------------------------------
 # Paths — auto-detect or override via env
@@ -74,20 +145,34 @@ def _find_memory_dir() -> pathlib.Path:
 SKILLS_DIR = _find_skills_dir()
 MEMORY_DIR = _find_memory_dir()
 MEMORY_MD = MEMORY_DIR / "MEMORY.md"
-EVOLUTION_LOG = pathlib.Path(__file__).parent.parent / "evolution.tsv"
+RUNS_DIR = pathlib.Path(__file__).parent.parent / "runs"
 
-# Thresholds
-AUTO_APPLY = 0.90
-FLAG_REVIEW = 0.70
-MIN_LOG = 0.50
-IMMEDIATE_CONFIDENCE_CAP = 0.65  # single-session behavioral candidates capped here
+
+def _make_run_dir(hours: int) -> pathlib.Path:
+    """Create a timestamped run directory: runs/2026-04-17T04-26_168h/"""
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M")
+    name = f"{stamp}_{hours}h"
+    run_dir = RUNS_DIR / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    latest = RUNS_DIR / "latest"
+    try:
+        if latest.is_symlink() or latest.exists():
+            latest.unlink()
+        latest.symlink_to(name)
+    except OSError:
+        pass
+    return run_dir
+
+
+# Confidence cap for single-session behavioral candidates (used by per-session pass)
+IMMEDIATE_CONFIDENCE_CAP = 0.65
 
 # Session filters
 MIN_SPANS = 10
 MIN_DURATION_MS = 120_000
 
 # ---------------------------------------------------------------------------
-# Context loaders
+# Context loaders — feed existing local layout into the LLM prompt
 # ---------------------------------------------------------------------------
 
 def load_skills_index() -> str:
@@ -114,135 +199,71 @@ def load_memory_index() -> str:
     return MEMORY_MD.read_text().strip()
 
 # ---------------------------------------------------------------------------
-# Apply candidates
-# ---------------------------------------------------------------------------
-
-def apply_skill(candidate: dict, dry_run: bool) -> str:
-    path = SKILLS_DIR / candidate["path"] / "SKILL.md"
-    action = candidate["action"]
-    if dry_run:
-        return f"[dry-run] would {action} skill at {path}"
-    content = candidate.get("content", "")
-    if action == "create":
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if content:
-            path.write_text(content)
-        else:
-            path.write_text(f"---\nname: {candidate['name']}\ndescription: {candidate['description']}\n---\n\n# {candidate['name']}\n\n{candidate.get('evidence', '')}\n")
-        return f"created {path}"
-    elif action == "update" and path.exists():
-        if content:
-            path.write_text(content)
-        else:
-            existing = path.read_text()
-            note = f"\n\n## Update ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n{candidate.get('evidence', '')}"
-            path.write_text(existing + note)
-        return f"updated {path}"
-    return f"skipped {action} {path}"
-
-
-def apply_memory(candidate: dict, dry_run: bool) -> str:
-    filename = candidate["filename"]
-    mem_path = MEMORY_DIR / filename
-    action = candidate["action"]
-    if dry_run:
-        return f"[dry-run] would {action} memory at {mem_path}"
-    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-    content = candidate.get("content", "")
-    if not content:
-        content = f"""---
-name: {candidate['name']}
-description: {candidate['description']}
-type: {candidate.get('type', 'feedback')}
----
-
-{candidate.get('evidence', '')}
-"""
-    if action == "create" or (action == "update" and not mem_path.exists()):
-        mem_path.write_text(content)
-        if MEMORY_MD.exists():
-            index = MEMORY_MD.read_text()
-            entry = f"- [{candidate['name']}]({filename}) -- {candidate['description']}"
-            if filename not in index:
-                MEMORY_MD.write_text(index.rstrip() + "\n" + entry + "\n")
-        return f"created {mem_path}"
-    elif action == "update" and mem_path.exists():
-        mem_path.write_text(content)
-        return f"updated {mem_path}"
-    return f"skipped {action} {mem_path}"
-
-# ---------------------------------------------------------------------------
-# Evolution log
-# ---------------------------------------------------------------------------
-
-def log_evolution(entries: list[dict], dry_run: bool):
-    write_header = not EVOLUTION_LOG.exists()
-    mode = "dry-run" if dry_run else "live"
-    staso_url = os.environ.get("STASO_API_URL", "")
-    with open(EVOLUTION_LOG, "a") as f:
-        if write_header:
-            f.write("date\tmode\tstaso_url\taction\ttype\tpath\tconfidence\tapplied\tevidence\n")
-        for e in entries:
-            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            f.write(
-                f"{date}\t{mode}\t{staso_url}\t{e['action']}\t{e['type']}\t{e.get('path', '-')}\t"
-                f"{e['confidence']:.2f}\t{e['applied']}\t{e.get('evidence', '')[:100]}\n"
-            )
-
-# ---------------------------------------------------------------------------
 # Review file
 # ---------------------------------------------------------------------------
 
 def _write_review_md(path: pathlib.Path, skills: list, memories: list, insights: list,
                      session_summaries: list[tuple[int, dict]] | None = None):
-    """Generate a human-readable markdown review of candidates."""
-    lines = [f"# engram review -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
-    lines.append(f"Delete unwanted entries from the companion `.json` file, then run `--apply-from`.\n")
+    """Human-readable candidate review. Apply via Claude Code's /engram-apply skill."""
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"# engram review — {stamp}", ""]
+
+    def _render_candidate(idx: int, c: dict, kind: str):
+        """kind: 'skill' or 'memory'. Writes a single candidate block."""
+        action = c.get("action", "?").upper()
+        target = c.get("path", "?") if kind == "skill" else c.get("filename", "?")
+        conf = c.get("confidence", 0)
+        sc = c.get("session_count", "?")
+        lines.append(f"### [{idx}] {action} `{target}` — {conf:.2f}, {sc} sessions")
+        lines.append(c.get("name", ""))
+        if c.get("description") and c["description"] != c.get("name"):
+            lines.append(c["description"])
+        lines.append("")
+        lines.append(f"Evidence: {c.get('evidence', '')}")
+        lines.append("")
+        content = c.get("content", "")
+        if content:
+            lines.append("```markdown")
+            lines.append(content.rstrip())
+            lines.append("```")
+        lines.append("")
 
     if skills:
-        lines.append(f"## Skills ({len(skills)})\n")
+        lines.append(f"## Skills ({len(skills)})")
+        lines.append("")
         for i, s in enumerate(skills, 1):
-            lines.append(f"### [{i}] {s.get('action','?').upper()} `{s.get('path','?')}` -- confidence {s.get('confidence',0):.2f} ({s.get('session_count','?')} sessions)\n")
-            lines.append(f"**{s.get('name','')}**: {s.get('description','')}\n")
-            lines.append(f"**Evidence**: {s.get('evidence','')}\n")
-            content = s.get("content", "")
-            if content:
-                lines.append(f"**Content that would be written:**\n")
-                lines.append(f"```markdown\n{content}\n```\n")
+            _render_candidate(i, s, "skill")
 
     if memories:
-        lines.append(f"## Memories ({len(memories)})\n")
+        lines.append(f"## Memories ({len(memories)})")
+        lines.append("")
         for i, m in enumerate(memories, 1):
-            lines.append(f"### [{i}] {m.get('action','?').upper()} `{m.get('filename','?')}` -- confidence {m.get('confidence',0):.2f} ({m.get('session_count','?')} sessions)\n")
-            lines.append(f"**{m.get('name','')}** ({m.get('type','')})\n")
-            lines.append(f"**Evidence**: {m.get('evidence','')}\n")
-            content = m.get("content", "")
-            if content:
-                lines.append(f"**Content that would be written:**\n")
-                lines.append(f"```markdown\n{content}\n```\n")
+            _render_candidate(i, m, "memory")
 
     if insights:
-        lines.append(f"## Insights ({len(insights)})\n")
-        for i, ins in enumerate(insights, 1):
-            lines.append(f"- **[{ins.get('type','?')}]** ({ins.get('confidence',0):.2f}, {ins.get('session_count','?')} sessions): {ins.get('description','')}")
+        lines.append(f"## Insights ({len(insights)})")
+        lines.append("")
+        for ins in insights:
+            lines.append(f"- [{ins.get('type','?')}] {ins.get('confidence',0):.2f}, {ins.get('session_count','?')} sessions — {ins.get('description','')}")
             if ins.get("suggestion"):
-                lines.append(f"  - Suggestion: {ins['suggestion']}")
-            lines.append("")
+                lines.append(f"  → {ins['suggestion']}")
+        lines.append("")
 
-    # Append per-session summaries for reference
     if session_summaries:
-        lines.append(f"\n---\n\n## Per-Session Summaries (reference)\n")
+        lines.append("---")
+        lines.append("")
+        lines.append("## Session summaries (reference)")
+        lines.append("")
         for idx, summary in session_summaries:
-            goal = summary.get('goal', '?')
-            lines.append(f"### Session {idx+1}: {goal} [{summary.get('domain', '?')}]\n")
+            lines.append(f"**Session {idx+1}** — {summary.get('goal', '?')} [{summary.get('domain', '?')}]")
             for c in summary.get("corrections", []):
-                lines.append(f"- **correction**: {c.get('rejected', '')} -> {c.get('accepted', '')}")
+                lines.append(f"- {c.get('rejected', '')} → {c.get('accepted', '')}")
                 if c.get("quote"):
-                    lines.append(f"  > \"{c['quote']}\"")
+                    lines.append(f"  > {c['quote']}")
             for e in summary.get("errors", []):
-                lines.append(f"- **error**: {e.get('error', '')} -> {e.get('resolution', '')}")
+                lines.append(f"- err: {e.get('error', '')} → {e.get('resolution', '')}")
             if summary.get("notable"):
-                lines.append(f"- **notable**: {summary['notable']}")
+                lines.append(f"- note: {summary['notable']}")
             lines.append("")
 
     path.write_text("\n".join(lines))
@@ -257,38 +278,18 @@ def main():
     parser.add_argument("--hours", type=int, default=24, help="Look back N hours (default: 24)")
     parser.add_argument("--from", dest="from_dt", help="Start datetime (ISO)")
     parser.add_argument("--to", dest="to_dt", help="End datetime (ISO)")
-    parser.add_argument("--dry-run", action="store_true", help="Analyze only, don't write files")
+    parser.add_argument("--dry-run", action="store_true", help="Analyze only (default — apply is via Claude Code)")
     parser.add_argument("--show-candidates", action="store_true", help="Print full LLM-generated content for each candidate")
-    parser.add_argument("--min-confidence", type=float, default=MIN_LOG, help="Minimum confidence to log")
     parser.add_argument("--session", help="Analyze a specific session_id only")
     parser.add_argument("--trace", help="Analyze a specific trace_id only")
     parser.add_argument("--limit", type=int, help="Analyze only top N sessions by span count")
-    parser.add_argument("--save", metavar="FILE", help="Save candidates to JSON file after analysis")
-    parser.add_argument("--apply-from", metavar="FILE", dest="apply_from", help="Apply candidates from a previously saved JSON file (skip collect/compress/analyze)")
+    parser.add_argument("--save", nargs="?", const="auto", metavar="FILE_OR_DIR",
+                        help="Save candidates. Bare --save auto-creates runs/<timestamp>_<hours>h/. Pass a path to override.")
     args = parser.parse_args()
 
-    # --save implies dry-run (candidates are saved for later, not applied now)
+    # --save always implies dry-run (apply is delegated to Claude Code via the engram skill)
     if args.save:
         args.dry_run = True
-
-    # --apply-from: skip everything, just apply from saved JSON
-    if args.apply_from:
-        p = pathlib.Path(args.apply_from)
-        if not p.exists():
-            print(f"[learn] file not found: {p}")
-            sys.exit(1)
-        data = json.loads(p.read_text())
-        candidate_skills = data.get("candidate_skills", [])
-        candidate_memories = data.get("candidate_memories", [])
-        insights = data.get("insights", [])
-        print(f"[learn] loaded {len(candidate_skills)} skills, {len(candidate_memories)} memories, {len(insights)} insights from {p}")
-        print(f"[learn] skills: {SKILLS_DIR}")
-        print(f"[learn] memory: {MEMORY_DIR}")
-        print(f"[learn] dry-run: {args.dry_run}")
-        # User already cherry-picked, so apply everything (override min-confidence and thresholds)
-        args.min_confidence = 0
-        _apply_and_log(candidate_skills, candidate_memories, insights, args, force_apply=True)
-        return
 
     now = datetime.now(timezone.utc)
     if args.from_dt:
@@ -426,8 +427,8 @@ def main():
                     c["confidence"] = min(c["confidence"], IMMEDIATE_CONFIDENCE_CAP)
                     if c.get("kind") == "skill" and not c.get("path"):
                         c["path"] = "common/" + c.get("name", "unknown").lower().replace(" ", "-")
-                    if c.get("kind") != "skill" and not c.get("filename"):
-                        c["filename"] = c.get("name", "unknown").lower().replace(" ", "_").replace("-", "_") + ".md"
+                    if c.get("kind") != "skill":
+                        c["filename"] = _safe_filename(c.get("filename") or c.get("name", "unknown"))
                     if not c.get("type") and c.get("kind") != "skill":
                         c["type"] = "feedback"
                 immediate_candidates.extend(imm)
@@ -462,8 +463,7 @@ def main():
     if len(session_llm_summaries) < 2:
         print("\n[learn] single session -- skipping cross-session (need 2+)")
         if immediate_candidates:
-            print(f"[learn] processing {len(immediate_candidates)} behavioral candidate(s) from per-session")
-            _apply_and_log([], immediate_candidates, [], args, force_apply=False)
+            print(f"[learn] {len(immediate_candidates)} per-session candidate(s) without gatekeeper review — recommend a wider --hours window")
         else:
             print("[learn] run with --hours 168 or more to analyze multiple sessions")
         return
@@ -489,65 +489,72 @@ def main():
         .replace("{session_summaries}", cross_session_input)
     )
 
-    print(f"  [analyzing {len(session_llm_summaries)} sessions...]", end="", flush=True)
+    import threading
+    _cross_start = time.time()
+    _stop = threading.Event()
+    _n_sess = len(session_llm_summaries)
+
+    def _tick():
+        while not _stop.is_set():
+            el = _fmt_elapsed(time.time() - _cross_start)
+            print(f"\r\033[K  analyzing  {_n_sess} sessions  {el}", end="", flush=True)
+            _stop.wait(1.0)
+
+    if _IS_TTY:
+        _ticker = threading.Thread(target=_tick, daemon=True)
+        _ticker.start()
+    else:
+        print(f"  analyzing {_n_sess} sessions...", flush=True)
+        _ticker = None
+
     try:
         result = call_llm(cross_prompt, model_override=cross_session_model)
-        print(" done")
     except Exception as e:
-        print(f" error: {e}")
+        if _ticker:
+            _stop.set()
+            _ticker.join(timeout=0.2)
+        print(f"\r\033[K  error: {e}", flush=True)
         return
+    finally:
+        if _ticker:
+            _stop.set()
+            _ticker.join(timeout=0.2)
+    el = _fmt_elapsed(time.time() - _cross_start)
+    if _IS_TTY:
+        print(f"\r\033[K  analyzed   {_n_sess} sessions  {el}", flush=True)
+    else:
+        print(f"  analyzed {_n_sess} sessions in {el}", flush=True)
 
+    # R1 is the gatekeeper — its output already includes filtered/promoted per-session candidates.
+    # No more code-level merging or dedup; what R1 says is what ships.
     candidate_skills = result.get("candidate_skills", [])
     candidate_memories = result.get("candidate_memories", [])
     insights = result.get("insights", [])
 
-    # Merge immediate behavioral candidates from per-session pass
-    # Dedup: fuzzy match — normalize names to keywords and skip if cross-session covers it
-    def _name_keys(candidate: dict) -> set[str]:
-        raw = (candidate.get("filename", "") + " " + candidate.get("name", "") + " " + candidate.get("path", "")).lower()
-        for prefix in ("feedback_", "memory_", "user_", "project_", "reference_", "common/", "backend/", "frontend/"):
-            raw = raw.replace(prefix, " ")
-        raw = raw.replace(".md", "").replace("_", " ").replace("-", " ").replace("/", " ")
-        return {w for w in raw.split() if len(w) > 2}
-
-    # Dedup immediate candidates against both cross-session memories AND skills
-    all_cross = candidate_memories + [{"name": s.get("name", ""), "filename": "", "path": s.get("path", "")} for s in candidate_skills]
-    cross_keysets = [_name_keys(m) for m in all_cross]
-    merged_immediate = 0
-    for imm in immediate_candidates:
-        imm_keys = _name_keys(imm)
-        is_dup = any(
-            len(imm_keys & ck) >= max(2, len(imm_keys) * 0.5)
-            for ck in cross_keysets
-        )
-        if not is_dup:
-            # Route based on kind: skill candidates go to skills, everything else to memories
-            if imm.get("kind") == "skill" and imm.get("path"):
-                candidate_skills.append(imm)
-            else:
-                candidate_memories.append(imm)
-            cross_keysets.append(imm_keys)
-            merged_immediate += 1
-
-    cross_count = len(candidate_memories) + len(candidate_skills) - merged_immediate
-    print(f"\n[learn] results: {len(candidate_skills)} skills, {len(candidate_memories)} memories ({merged_immediate} from per-session), {len(insights)} insights")
+    print(f"\n[learn] results: {len(candidate_skills)} skills, {len(candidate_memories)} memories, {len(insights)} insights")
 
     # --save: dump candidates to JSON + generate readable review markdown
     if args.save:
-        save_path = pathlib.Path(args.save)
+        save_arg = pathlib.Path(args.save)
+        # If user passed a directory OR the default "auto" sentinel, use runs/<timestamp>/
+        if str(save_arg) == "auto" or save_arg.is_dir() or save_arg.suffix == "":
+            run_dir = _make_run_dir(args.hours)
+            save_path = run_dir / "candidates.json"
+            review_path = run_dir / "candidates.md"
+        else:
+            # User provided explicit filename — use it as-is
+            save_path = save_arg
+            review_path = save_arg.with_suffix(".md")
         save_data = {
             "candidate_skills": candidate_skills,
             "candidate_memories": candidate_memories,
             "insights": insights,
         }
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_text(json.dumps(save_data, indent=2))
-        # Generate companion review file
-        review_path = save_path.with_suffix(".md")
         _write_review_md(review_path, candidate_skills, candidate_memories, insights, session_llm_summaries)
         print(f"[learn] saved to {save_path}")
         print(f"[learn] review: {review_path}")
-        print(f"[learn] edit {save_path.name} to remove unwanted candidates, then:")
-        print(f"  uv run python -m engram.learn --apply-from {save_path}")
 
     # Show candidates (compact terminal output)
     if args.show_candidates:
@@ -573,83 +580,10 @@ def main():
                 print(f"      {ins.get('description','')[:120]}")
         print(f"\n{sep}")
 
-    _apply_and_log(candidate_skills, candidate_memories, insights, args,
-                    force_apply=False, quiet=args.show_candidates)
-
-
-def _apply_and_log(candidate_skills, candidate_memories, insights, args,
-                    force_apply=False, quiet=False):
-    """Apply candidates and log evolution. Used by both normal flow and --apply-from.
-    When force_apply=True (from --apply-from), all candidates are applied regardless of confidence.
-    When quiet=True, only print auto-applied entries (skip flag/log lines already shown by --show-candidates)."""
-    log_entries = []
-
-    if not quiet:
-        print("\n[learn] skills:")
-    for s in candidate_skills:
-        conf = s.get("confidence", 0)
-        path = s.get("path", "?")
-        action = s.get("action", "?")
-        evidence = s.get("evidence", "")
-        if conf < args.min_confidence:
-            continue
-        status = "log-only"
-        if force_apply or conf >= AUTO_APPLY:
-            msg = apply_skill(s, dry_run=args.dry_run)
-            status = "auto-applied" if not args.dry_run else "dry-run"
-            print(f"  apply ({conf:.2f}) [{action}] {path} -- {msg}")
-        elif conf >= FLAG_REVIEW:
-            if not quiet:
-                print(f"  flag  ({conf:.2f}) [{action}] {path} -- {evidence}")
-            status = "flagged"
-        else:
-            if not quiet:
-                print(f"  log   ({conf:.2f}) [{action}] {path}")
-        log_entries.append({"action": action, "type": "skill", "path": path,
-                            "confidence": conf, "applied": status, "evidence": evidence})
-
-    if not quiet:
-        print("\n[learn] memories:")
-    for m in candidate_memories:
-        conf = m.get("confidence", 0)
-        filename = m.get("filename", "?")
-        action = m.get("action", "?")
-        evidence = m.get("evidence", "")
-        if conf < args.min_confidence:
-            continue
-        status = "log-only"
-        if force_apply or conf >= AUTO_APPLY:
-            msg = apply_memory(m, dry_run=args.dry_run)
-            status = "auto-applied" if not args.dry_run else "dry-run"
-            print(f"  apply ({conf:.2f}) [{action}] {filename} -- {msg}")
-        elif conf >= FLAG_REVIEW:
-            if not quiet:
-                print(f"  flag  ({conf:.2f}) [{action}] {filename} -- {evidence}")
-            status = "flagged"
-        else:
-            if not quiet:
-                print(f"  log   ({conf:.2f}) [{action}] {filename}")
-        log_entries.append({"action": action, "type": "memory", "path": filename,
-                            "confidence": conf, "applied": status, "evidence": evidence})
-
-    if not quiet:
-        print("\n[learn] insights:")
-    for ins in insights:
-        conf = ins.get("confidence", 0)
-        if conf >= args.min_confidence:
-            if not quiet:
-                print(f"  ({conf:.2f}) [{ins.get('type','?')}] {ins.get('description','')}")
-                if ins.get("suggestion"):
-                    print(f"          -> {ins.get('suggestion','')}")
-            log_entries.append({"action": "insight", "type": ins.get("type", "?"), "path": "-",
-                                "confidence": conf, "applied": "logged", "evidence": ins.get("description", "")[:100]})
-
-    if log_entries:
-        log_evolution(log_entries, dry_run=args.dry_run)
-
-    applied = sum(1 for e in log_entries if e["applied"] == "auto-applied")
-    flagged = sum(1 for e in log_entries if e["applied"] == "flagged")
-    print(f"\n[learn] done -- {len(log_entries)} logged, {applied} applied, {flagged} flagged")
+    # Apply is delegated to Claude Code via the engram skill — see .claude/skills/engram/SKILL.md
+    print(f"\n[learn] done -- {len(candidate_skills)} skills, {len(candidate_memories)} memories, {len(insights)} insights")
+    if args.save:
+        print("[learn] next: open Claude Code in this repo and run /engram-apply runs/latest/candidates.md")
 
 
 if __name__ == "__main__":

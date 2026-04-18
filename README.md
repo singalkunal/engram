@@ -1,111 +1,156 @@
 # engram
 
-  Your coding agent forgets everything between sessions. This script helps agent remember them by mutating its skills and memories.
+Your coding agent forgets between sessions. engram makes it remember.
 
-Mines session traces, detects personal patterns via LLM analysis, writes results back as Claude Code skills and memory entries.
+Mines session traces, finds personal patterns, writes them back as Claude Code skills and memory entries.
 
 ## How it works
 
 ```
-traces --> compress --> per-session summarize --> cross-session patterns --> apply
+traces -> compress -> per-session extract -> cross-session gatekeeper -> apply
 ```
 
-1. **Collect** -- Fetch recent sessions from trace provider (Staso)
-2. **Compress** -- Extract signal: prompts, corrections, errors, tool usage, content produced
-3. **Per-session** -- Cheap/fast LLM: structured extraction + immediate behavioral candidates
-4. **Cross-session** -- Stronger LLM: find patterns across 2+ sessions a fresh session would get wrong
-5. **Apply** -- Write skill/memory files based on confidence and recurrence
+1. **Fetch** recent sessions
+2. **Compress** each into structured signal (prompts, corrections, errors, content produced)
+3. **Per-session pass** (cheap model): extract candidate hints permissively
+4. **Cross-session pass** (strong reasoning model): act as gatekeeper — filter feature-specific noise, promote recurring patterns, output the final candidate list
+5. **Apply** based on confidence
 
-### Two types of learnings
+Confidence scales with recurrence:
 
-**Cross-session patterns** (need 2+ sessions): the same correction repeated across sessions is a rule, not noise. Confidence scales with recurrence.
-
-| Sessions | Confidence cap |
+| Sessions | Cap |
 |---|---|
+| 1 | 0.65 |
 | 2 | 0.70 |
 | 3 | 0.85 |
 | 4+ | 0.95 |
 
-**Immediate behavioral candidates** (single session, 0.65 cap): explicit user directives about agent behavior -- "don't ever mock databases", "no emojis", "use uv not pip". The test: would this apply on a completely different project? If yes, it's behavioral and gets extracted immediately. Feature-specific corrections ("use this endpoint") stay in summaries for cross-session analysis only.
+The bar: *would a fresh AI session get this wrong without this info?* If no, drop it.
 
 ## Quickstart
 
 ```bash
 git clone https://github.com/AgenticLeash/engram.git
 cd engram
-cp .env.example .env
-# fill in trace provider API key + LLM key
-uv run python -m engram.learn --hours 168 --show-candidates
+cp .env.example .env  # fill in trace key + LLM key (or use Claude Code, see below)
+uv run python -m engram.learn --hours 168 --save
 ```
 
 Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
+> **No LLM API key?** Set `LLM_PROVIDER=claude-code` in `.env` and engram runs through your local Claude Code CLI. Uses your existing subscription, no extra cost, no third-party LLM keys.
+
 ## Usage
 
 ```bash
-# last 7 days, dry run
-uv run python -m engram.learn --hours 168 --show-candidates
+# generate candidates (engram's only job)
+uv run python -m engram.learn --hours 168 --save
 
-# last 24 hours, apply high-confidence results
-uv run python -m engram.learn --hours 24
-
-# top 3 most active sessions only
-uv run python -m engram.learn --hours 168 --limit 3 --dry-run
-
-# specific session or trace
+# scoped runs
 uv run python -m engram.learn --session <id> --dry-run
 uv run python -m engram.learn --trace <id> --dry-run
+uv run python -m engram.learn --hours 168 --limit 3 --dry-run
 
-# cherry-pick: save candidates, edit, then apply
-uv run python -m engram.learn --hours 168 --save candidates.json
-# edit candidates.json to keep only what you want
-uv run python -m engram.learn --apply-from candidates.json
-
-# override model at runtime
+# model override
 LLM_MODEL=deepseek/deepseek-r1-0528 uv run python -m engram.learn --hours 168 --dry-run
+```
+
+Then in Claude Code (in the repo where you want to apply learnings):
+
+```
+/engram-apply runs/latest/candidates.md
+```
+
+The `/engram-apply` skill (shipped in `.claude/skills/engram-apply/`) reads your local skill/memory layout, places each candidate in the right subdirectory, updates parent index files and `MEMORY.md`, and skips anything that doesn't fit your conventions.
+
+**Why the split?** Engram analyzes cross-session traces (Claude Code can't see those). Claude Code knows your local layout, conventions, and what's already there (engram doesn't). Each does what only it can do.
+
+### Output
+
+```
+[learn] fetching 12 sessions (from 17 total)
+  ████████████████████████  100%  12/12  fetched  8s
+[learn] compressed 12 sessions (5415 spans)
+[learn] per-session pass (openrouter / google/gemini-2.5-flash)
+  ████████████████████████  100%  12/12  sessions  19s
+[learn] cross-session pass (openrouter / deepseek/deepseek-r1-0528)
+  analyzed   12 sessions  4m02s
+[learn] results: 2 skills, 5 memories, 1 insights
+[learn] saved to runs/2026-04-18T04-06_168h/candidates.json
+[learn] review: runs/2026-04-18T04-06_168h/candidates.md
+[learn] done -- 2 skills, 5 memories, 1 insights
+[learn] next: open Claude Code in this repo and run /engram-apply runs/latest/candidates.md
+```
+
+### Run organization
+
+Each `--save` creates a timestamped directory:
+
+```
+runs/
+├── 2026-04-15T12-00_168h/
+│   ├── candidates.json   # machine-readable, edit to drop entries
+│   └── candidates.md     # human-readable review
+└── latest -> 2026-04-15T12-00_168h
 ```
 
 ## Configuration
 
-See [`.env.example`](.env.example).
-
 ```bash
-STASO_API_KEY=                        # required
-STASO_API_URL=https://api.staso.ai
-
-LLM_PROVIDER=openrouter               # openrouter | deepseek | claude-code
+STASO_API_KEY=                                       # or your trace provider's key
+LLM_PROVIDER=openrouter                              # openrouter | deepseek | claude-code
 OPENROUTER_API_KEY=
-LLM_MODEL=deepseek/deepseek-chat      # fallback for both passes
+LLM_MODEL=deepseek/deepseek-chat                     # default for both passes
 
-# per-pass model overrides (optional)
-LLM_MODEL_PER_SESSION=google/gemini-2.0-flash-001   # cheap, fast extraction
-LLM_MODEL_CROSS_SESSION=google/gemini-2.5-flash      # stronger pattern detection
+# per-pass overrides (optional but recommended)
+LLM_MODEL_PER_SESSION=google/gemini-2.5-flash        # cheap extraction
+LLM_MODEL_CROSS_SESSION=deepseek/deepseek-r1-0528    # gatekeeper, needs reasoning
 ```
 
 ### Models
 
 | Model | Cost | Use |
 |---|---|---|
-| `google/gemini-2.0-flash-001` | $0.10/M | Per-session extraction |
-| `deepseek/deepseek-chat` | $0.14/M | Good default for both |
-| `google/gemini-2.5-flash` | $0.30/M | Cross-session analysis |
-| `deepseek/deepseek-r1-0528` | $0.50/M | Deep pattern detection |
+| `google/gemini-2.0-flash-001` | $0.10/M | Cheap per-session extraction |
+| `google/gemini-2.5-flash` | $0.30/M | Better per-session extraction |
+| `deepseek/deepseek-r1-0528` | $0.50/M | Cross-session gatekeeper (recommended) |
 | `anthropic/claude-sonnet-4` | $3/M | Highest quality |
-
-No API key? Set `LLM_PROVIDER=claude-code` to use your local Claude Code CLI instead (uses your existing subscription, no extra cost).
+| `claude-code` | free | Uses your local Claude Code subscription, no API key needed |
 
 ## What it finds
 
-Real output from 19 sessions over 8 days:
+Real examples (sanitized).
 
-```
-(0.85, 4 sessions) [correction_pattern]  Always use create_ch_client(), never get_ch_client()
-(0.85, 3 sessions) [correction_pattern]  Build-time injection over runtime fetches for slow-moving config
-(0.80, 3 sessions) [workflow_habit]       Creates versioned design docs before implementation
-(0.70, 2 sessions) [correction_pattern]   Inline loaders where content changes, never page-level spinners
+**Skill promoted from 3 sessions:**
+
+```markdown
+---
+name: external-content-style
+description: User-facing content — professional, outcome-oriented, non-spammy
+---
+# External Content Style
+
+When creating UI text, marketing, changelogs, announcements:
+
+1. Focus on outcomes ("X now available" beats "We added X")
+2. Avoid fluff, hype words, overselling
+3. Serious founder-focused voice, no casual slang, no emojis
+4. Emphasize utility over promotion
+5. Consistent branding, loading states for async ops
 ```
 
-The bar: would a fresh AI session get this wrong without this info? If yes, it's a real pattern. If the agent would naturally do the right thing, it's noise.
+**Memory captured from 2 sessions:**
+
+```markdown
+---
+name: Avoid Security Cliches
+type: feedback
+---
+Never use stereotypical security imagery (shields, locks) in logos or branding.
+Prioritize unique, abstract geometric designs that convey precision.
+```
+
+**What gets filtered out:** platform limits, tool errors, project-specific implementation choices, one-off product decisions. The gatekeeper rejects anything that wouldn't apply on a different project.
 
 ## Trace providers
 
@@ -113,9 +158,9 @@ Currently uses [Staso](https://staso.ai). Swap `staso.py` for other providers.
 
 ## Inspiration
 
-- [Hermes Agent](https://hermes-agent.nousresearch.com) -- in-session self-learning with skills, memory, and cross-session recall via SQLite FTS5
-- [OpenClaw](https://github.com/openclaw/openclaw) -- personal AI assistant with persistent memory and skill acquisition
-- Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) -- modify, test, keep/discard loop with git as memory
+- [Hermes Agent](https://hermes-agent.nousresearch.com) — in-session self-learning, cross-session recall via SQLite FTS5
+- [OpenClaw](https://github.com/openclaw/openclaw) — personal AI assistant with memory and skill acquisition
+- Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) — modify, test, keep/discard with git as memory
 
 ## License
 

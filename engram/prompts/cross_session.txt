@@ -6,6 +6,17 @@ is noise. The same correction in 3 sessions is a rule.
 THE BAR: Would a fresh AI session get this WRONG without this information?
 If no — if the agent would naturally do the right thing — it's not worth storing.
 
+## Step 1 (mandatory): check existing before proposing
+
+Before proposing ANY candidate:
+- Scan "Existing Skills" below. Is this pattern already covered?
+- Scan "Existing Memory" below. Is there an entry that overlaps?
+- Scan "Behavioral Candidates from Per-Session Pass". Already handled there?
+
+If there's meaningful overlap with an existing entry → propose UPDATE, not CREATE, and name
+the matching entry in your evidence field. If the candidate would be a strict subset of an
+existing entry → do NOT propose it at all.
+
 ## What's NOT worth learning
 - Things already in the code (bug fixes, product decisions reflected in implementation)
 - Things in git history (who changed what, when)
@@ -28,9 +39,48 @@ As MEMORIES (propose when you see a simple one-liner preference or fact):
 - "No emojis in code or comments"
 - "Lowercase commit messages, no conventional prefixes"
 
-THE DISTINCTION: If 2+ related corrections across sessions form a coherent set of rules for
-a type of work → consolidate into ONE skill. If it's a standalone preference → memory.
-3 corrections about the same theme should become 1 skill, not 3 memories.
+## COHERENCE TEST for skills (critical — apply this strictly)
+
+A skill is NOT just "multiple corrections about the same feature/area". It is a coherent
+guideline where every rule reinforces ONE transferable principle.
+
+Before proposing a skill, write the principle in ONE sentence. Then check: do ALL the
+corrections in the evidence naturally follow from that principle? If you have to say
+"various fixes in X", "assorted decisions about Y", or "mixed corrections in the Z area",
+it's a TOPIC CLUSTER, not a skill. Reject it.
+
+BAD (topic cluster — do not propose as skill):
+- "database layer": "use connection pooling" + "add query timeouts" + "prefer UUIDs over ints"
+  → three unrelated DB decisions. No shared principle, just the same subsystem.
+- "settings page UI": "add dark mode toggle" + "reorder sections" + "shrink the header"
+  → specific tweaks for one page. Wouldn't apply to a different page.
+- "API endpoints": "add /status route" + "rename users to accounts" + "add rate limit"
+  → touched the API but no common rule connects them.
+
+GOOD (coherent principle — propose as skill):
+- copywriting: "no hype words" + "outcome-focused" + "cut fluff" + "no emojis"
+  → principle: "write professional user-facing copy that lets the product speak."
+     Each rule follows directly.
+- testing: "never mock DBs" + "use real fixtures" + "seed from production snapshots"
+  → principle: "integration tests must hit real systems, not mocks."
+- review: "check before approving" + "don't oversell" + "only claim what's verified"
+  → principle: "be honest about what was actually done."
+
+If the evidence is a mix of unrelated corrections that happen to share a keyword, EACH one
+is either its own memory or nothing. Do not bundle them into a fake skill.
+
+## Skill path — match scope to principle, not evidence
+
+The skill's `path` should reflect its principle's SCOPE, not the evidence's location.
+Look at the existing skills layout below to see how THIS user organizes skills. Pick the
+directory whose scope matches your principle:
+- If the principle applies broadly across domains (copywriting, external communication,
+  thinking frameworks, testing philosophy), use the broadest/shared directory available.
+- Only narrow to a domain-specific directory when the principle is genuinely
+  domain-specific (e.g., a backend-only coding convention).
+
+A principle that would apply on a completely different codebase should NEVER sit in a
+domain-specific subfolder just because the evidence happened to come from that domain.
 
 ## Existing Skills
 {skills_index}
@@ -38,11 +88,24 @@ a type of work → consolidate into ONE skill. If it's a standalone preference �
 ## Existing Memory
 {memory_index}
 
-## Behavioral Candidates from Per-Session Pass
-The per-session analyzer already extracted these behavioral candidates (confidence 0.65).
-If you see the SAME pattern across 2+ sessions, PROMOTE it with higher confidence.
-If the pattern is only in one session, leave it — it's already handled.
-Do NOT re-propose something that's already here unless you're promoting it.
+## Per-Session Candidate Hints (you are the gatekeeper)
+
+A cheap model extracted these candidates from individual sessions. It was permissive — many
+will be feature-specific noise, not real behavioral patterns. YOU decide what makes the cut.
+
+For each hint, judge using the "would this apply on a completely different project tomorrow?" test:
+- If it's genuinely behavioral and useful → INCLUDE in your output as a memory or skill at
+  confidence 0.65 (single-session) or higher if you see it recurring in the session summaries
+- If it's actually feature-specific (implementation detail, config decision for THIS project,
+  architectural choice for THIS feature, naming for THIS product, behavior of the tool being
+  built in this session) → REJECT, do not include in your output
+- If you see the SAME pattern recurring across multiple session summaries below → PROMOTE
+  to higher confidence (2 sess = 0.70, 3 sess = 0.85, 4+ sess = 0.95)
+- If two hints describe the same pattern → CONSOLIDATE into one entry
+
+Your final candidate_skills/candidate_memories arrays are AUTHORITATIVE. Don't list a hint
+in your output unless you're keeping it. Don't add a separate "rejected" array — silent drop.
+
 {immediate_candidates}
 
 {common_instructions}
